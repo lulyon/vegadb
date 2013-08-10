@@ -168,9 +168,11 @@ static int example_init_func(void *p)
   (void) my_hash_init(&example_open_tables,system_charset_info,32,0,0,
                       (my_hash_get_key) example_get_key,0,0);
 
-  example_hton->state=   SHOW_OPTION_YES;
+  example_hton->state =  SHOW_OPTION_YES;
+  example_hton->db_type = DB_TYPE_BLACKHOLE_DB;
+  example_hton->slot = 0;
   example_hton->create=  example_create_handler;
-  example_hton->flags=   HTON_CAN_RECREATE;
+  example_hton->flags=   HTON_CAN_RECREATE | HTON_ALTER_NOT_SUPPORTED;
   example_hton->system_database=   example_system_database;
   example_hton->is_supported_system_table= example_is_supported_system_table;
 
@@ -298,7 +300,7 @@ ha_example::ha_example(handlerton *hton, TABLE_SHARE *table_arg)
 */
 
 static const char *ha_example_exts[] = {
-  NullS
+	".csv", NullS
 };
 
 const char **ha_example::bas_ext() const
@@ -390,6 +392,30 @@ int ha_example::open(const char *name, int mode, uint test_if_locked)
     DBUG_RETURN(1);
   thr_lock_data_init(&share->lock,&lock,NULL);
 
+
+	/* Allocate memory for the data file descriptor. */
+	file= (CSV_INFO*)my_malloc(sizeof(CSV_INFO),MYF(MY_WME));
+	if (!file)
+	  return 1;
+
+	/* Translate the name of the name into the data file name. */
+	fn_format(file->fname, name, "", ".csv",
+	   MY_REPLACE_EXT|MY_UNPACK_FILENAME);
+
+	/*
+	   Open the file, and save the file handle id in the data
+	   file descriptor structure.
+	 */
+	if ((file->fd = my_open(file->fname,mode,MYF(0))) < 0)
+	{
+	  int error = my_errno;
+	  close();
+	  return error;
+	}
+
+	/* Read operations start from the beginning of the file. */
+	pos = 0;
+
   DBUG_RETURN(0);
 }
 
@@ -413,8 +439,226 @@ int ha_example::open(const char *name, int mode, uint test_if_locked)
 int ha_example::close(void)
 {
   DBUG_ENTER("ha_example::close");
+  /*
+       Clean up the lock structures, close the file handle, and
+       deallocate the data file descriptor memory.
+     */
+    thr_lock_delete(&share->lock);
+    if (file)
+    {
+      if (file->fd >= 0)
+        my_close(file->fd, MYF(0));
+      my_free(file);
+      file = 0;
+    }
+
+
   DBUG_RETURN(free_share(share));
 }
+
+/*
+   Read the line from the current position into the
+   caller-provided record buffer.
+ */
+int ha_example::fetch_line(uchar* buf)
+{
+  /*
+     Keep track of the current offset in the file as we read
+     portions of the line into a buffer.
+     Start at the current read cursor position.
+   */
+  my_off_t cur_pos = pos;
+
+  /*
+     We will use this to iterate through the array of
+     table field pointers to store the parsed data in the right
+     place and the right format.
+   */
+  Field** field = table->field;
+
+  /*
+    Used in parsing to remember the previous character. The impossible
+    value of 256 indicates that the last character either did not exist
+    (we are on the first one), or its value is irrelevant.
+  */
+  int last_c = 256;
+
+  /* Set to 1 if we are inside a quoted string. */
+  int in_quote = 0;
+
+  /* How many bytes we have seen so far in this line. */
+  uint bytes_parsed = 0;
+
+  /* Loop breaker flag. */
+  int line_read_done = 0;
+
+  /* Truncate the field value buffer. */
+  field_buf.length(0);
+
+  /* Attempt to read a whole line. */
+  for (;!line_read_done;)
+  {
+    /* Read a block into a local buffer and deal with errors. */
+    char buf[CSV_READ_BLOCK_SIZE];
+    uint bytes_read = my_pread(file->fd,(unsigned char *)buf,sizeof(buf),cur_pos,MYF(MY_WME));
+    if (bytes_read == MY_FILE_ERROR)
+      return HA_ERR_END_OF_FILE;
+    if (!bytes_read)
+      return HA_ERR_END_OF_FILE;
+
+    /*
+      If we reach this point, the read was successful. Start parsing the
+      data we have read.
+    */
+    char* p = buf;
+    char* buf_end = buf + bytes_read;
+
+    /* For each byte in the buffer. */
+    for (;p < buf_end;)
+    {
+      char c = *p;
+      int end_of_line = 0;
+      int end_of_field = 0;
+      int char_escaped = 0;
+
+      switch (c)
+      {
+        /*
+          A double-quote marks the start or the end of a quoted string
+          unless it has been escaped.
+        */
+        case '"':
+          if (last_c == '"' || last_c == '\\')
+          {
+            field_buf.append(c);
+            char_escaped = 1;
+
+            /*
+              When we see the first quote, in_quote will get flipped.
+              A subsequent quote, however, tells us we are still inside the
+              quoted string.
+            */
+            if (last_c == '"')
+              in_quote = 1;
+          }
+          else
+            in_quote = !in_quote;
+          break;
+        /*
+          Treat the backward slash as an escape character.
+        */
+        case '\\':
+          if (last_c == '\\')
+          {
+             field_buf.append(c);
+             char_escaped = 1;
+          }
+          break;
+
+        /*
+          Set the termination flags on end-of-line unless it is quoted.
+        */
+        case '\r':
+        case '\n':
+          if (in_quote)
+          {
+            field_buf.append(c);
+          }
+          else
+          {
+            end_of_line = 1;
+            end_of_field = 1;
+          }
+          break;
+
+        /* Comma signifies end-of-field unless quoted. */
+        case ',':
+          if (in_quote)
+          {
+            field_buf.append(c);
+          }
+          else
+            end_of_field = 1;
+          break;
+
+        /*
+          Regular charcters just get appended to the field
+          value buffer.
+        */
+        default:
+          field_buf.append(c);
+          break;
+      }
+
+      /*
+        If at the end a field, and a matching field exists in the table
+        (it may not if the CSV file has extra fields), transfer the field
+        value buffer contents into the corresponding Field object. This
+        actually takes care of initializing the correct parts of the buffer
+        argument passed to us by the caller. The internal convention of the
+        optimizer dictates that the buffer pointers of the Field objects
+        must already be set up to point at the correct areas of the buffer
+        argument prior to calls to the data-retrieval methods of the handler
+        class.
+      */
+      if (end_of_field && *field)
+      {
+         (*field)->store(field_buf.ptr(),field_buf.length(),
+            system_charset_info);
+         field++;
+         field_buf.length(0);
+      }
+
+      /*
+        Special case - a character that was escaped itself should not be
+        regared as an escape character.
+      */
+      if (char_escaped)
+        last_c = 256;
+      else
+        last_c = c;
+      p++;
+
+      /* Prepare for loop exit on end-of-line. */
+      if (end_of_line)
+      {
+        if (c == '\r')
+          p++;
+        line_read_done = 1;
+        in_quote = 0;
+        break;
+      }
+    }
+
+    /* Block read/parse cycle is complete - update the counters. */
+    bytes_parsed += (p - buf);
+    cur_pos += bytes_read;
+  }
+
+  /*
+    Now we are done with the line read/parsing. We still have a number
+    of small tasks left to complete the job.
+  */
+
+  /* Initialize the NULL indicator flags in the record. */
+  memset(buf,0,table->s->null_bytes);
+
+  /*
+    The parsed line may not have had the values of all of the fields.
+    Set the remaining fields to their default values.
+   */
+  for (;*field;field++)
+  {
+    (*field)->set_default();
+  }
+
+  /* Move the cursor to the next record. */
+  pos += bytes_parsed;
+
+  /* Report success. */
+  return 0;
+}
+
 
 
 /**
@@ -628,7 +872,14 @@ int ha_example::index_last(uchar *buf)
 int ha_example::rnd_init(bool scan)
 {
   DBUG_ENTER("ha_example::rnd_init");
-  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  pos = 0;
+  stats.records = 0;
+  DBUG_RETURN(0);
+}
+int ha_example::index_init(uint idx)
+{
+  	active_index = idx;
+  	return 0;
 }
 
 int ha_example::rnd_end()
@@ -658,7 +909,24 @@ int ha_example::rnd_next(uchar *buf)
   DBUG_ENTER("ha_example::rnd_next");
   MYSQL_READ_ROW_START(table_share->db.str, table_share->table_name.str,
                        TRUE);
-  rc= HA_ERR_END_OF_FILE;
+
+  /*
+      Increment the global statistics counter displayed by SHOW STATUS
+      under Handler_read_rnd_next.
+  */
+  ha_statistic_increment(&SSV::ha_read_rnd_next_count);
+
+  /* fetch_line() does the actual work. */
+  int error = fetch_line(buf);
+  /*
+      On success, update our estimate for the total number of records in the
+      table.
+    */
+    if (!error)
+      stats.records++;
+
+//  rc= HA_ERR_END_OF_FILE;
+  rc = error;
   MYSQL_READ_ROW_DONE(rc);
   DBUG_RETURN(rc);
 }
@@ -688,6 +956,7 @@ int ha_example::rnd_next(uchar *buf)
 void ha_example::position(const uchar *record)
 {
   DBUG_ENTER("ha_example::position");
+  my_store_ptr(ref,ref_length,pos);
   DBUG_VOID_RETURN;
 }
 
@@ -705,13 +974,18 @@ void ha_example::position(const uchar *record)
   @see
   filesort.cc, records.cc, sql_insert.cc, sql_select.cc and sql_update.cc
 */
-int ha_example::rnd_pos(uchar *buf, uchar *pos)
+int ha_example::rnd_pos(uchar *buf, uchar *set_pos)
 {
   int rc;
   DBUG_ENTER("ha_example::rnd_pos");
   MYSQL_READ_ROW_START(table_share->db.str, table_share->table_name.str,
                        TRUE);
-  rc= HA_ERR_WRONG_COMMAND;
+
+  ha_statistic_increment(&SSV::ha_read_rnd_count);
+  pos = my_get_ptr(set_pos,ref_length);
+  rc = fetch_line(buf);
+
+//  rc= HA_ERR_WRONG_COMMAND;
   MYSQL_READ_ROW_DONE(rc);
   DBUG_RETURN(rc);
 }
@@ -758,6 +1032,33 @@ int ha_example::rnd_pos(uchar *buf, uchar *pos)
 int ha_example::info(uint flag)
 {
   DBUG_ENTER("ha_example::info");
+/*
+The optimizer must never think that the table has fewer than
+two records unless this is indeed the case. Reporting a smaller number
+makes the optimizer assume it needs to read no more than one record from
+the table. Our storage engine does always know the number of records,
+and in many cases cannot even make a good guess. To be safe and to keep
+things simple, we always report that we have at least 2 records.
+*/
+  if (stats.records < 2)
+	  stats.records = 2;
+
+  /*
+     The rest of the variables merely appear in SHOW TABLE STATUS output and
+     do not affect the optimizer. For the purpose of this example they can
+     be set to 0.
+    */
+
+  stats.deleted = 0;
+    errkey = 0;
+    stats.mean_rec_length = 0;
+    stats.data_file_length = 0;
+    stats.index_file_length = 0;
+    stats.max_data_file_length = 0;
+    stats.delete_length = 0;
+    if (example_hton->flags & HA_STATUS_AUTO)
+      stats.auto_increment_value = 1;
+
   DBUG_RETURN(0);
 }
 
@@ -1066,9 +1367,9 @@ mysql_declare_plugin(example)
 {
   MYSQL_STORAGE_ENGINE_PLUGIN,
   &example_storage_engine,
-  "EXAMPLE",
-  "Brian Aker, MySQL AB",
-  "Example storage engine",
+  "Shapefile",
+  "Lu Liang, ICT CAS",
+  "VegaDB storage engine",
   PLUGIN_LICENSE_GPL,
   example_init_func,                            /* Plugin Init */
   example_done_func,                            /* Plugin Deinit */

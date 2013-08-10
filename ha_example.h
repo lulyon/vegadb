@@ -51,6 +51,20 @@ typedef struct st_example_share {
   THR_LOCK lock;
 } EXAMPLE_SHARE;
 
+
+/* The CSV lines could be big. Read them in blocks of 512. */
+#define CSV_READ_BLOCK_SIZE   512
+
+/*
+  Following the tradition of other storage engines, we put all of the
+  low-level information under a separate structure.
+ */
+struct CSV_INFO
+{
+  char fname[FN_REFLEN+1];
+  int fd;
+} ;
+
 /** @brief
   Class definition for the storage engine
 */
@@ -58,6 +72,18 @@ class ha_example: public handler
 {
   THR_LOCK_DATA lock;      ///< MySQL lock
   EXAMPLE_SHARE *share;    ///< Shared lock info
+
+  /* Low-level storage engine data. */
+  CSV_INFO* file;
+
+  /* Table scan cursor.*/
+  my_off_t pos;
+
+  /* Buffer for reading CSV line blocks. */
+   char read_buf[CSV_READ_BLOCK_SIZE];
+
+   /* Buffer for parsing the field values. */
+   String field_buf;
 
 public:
   ha_example(handlerton *hton, TABLE_SHARE *table_arg);
@@ -68,7 +94,7 @@ public:
   /** @brief
     The name that will be used for display purposes.
    */
-  const char *table_type() const { return "EXAMPLE"; }
+  const char *table_type() const { return "SHAPEFILE"; }
 
   /** @brief
     The name of the index type that will be used for display.
@@ -80,6 +106,7 @@ public:
     The file extensions.
    */
   const char **bas_ext() const;
+
 
   /** @brief
     This is a list of flags that indicate what functionality the storage engine
@@ -179,6 +206,9 @@ public:
   */
   int close(void);                                              // required
 
+  /* See the comment in the implementation file. */
+  int fetch_line(uchar* buf);
+
   /** @brief
     We implement this in ha_example.cc. It's not an obligatory method;
     skip it and and MySQL will treat it as not implemented.
@@ -195,6 +225,7 @@ public:
     We implement this in ha_example.cc. It's not an obligatory method;
     skip it and and MySQL will treat it as not implemented.
   */
+
   int delete_row(const uchar *buf);
 
   /** @brief
@@ -237,6 +268,8 @@ public:
     it again. This is a required method.
   */
   int rnd_init(bool scan);                                      //required
+  int index_init(uint idx);
+
   int rnd_end();
   int rnd_next(uchar *buf);                                     ///< required
   int rnd_pos(uchar *buf, uchar *pos);                          ///< required
