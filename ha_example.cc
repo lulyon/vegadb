@@ -1,3 +1,8 @@
+/*
+ * author luliang@ict.ac.cn
+ * Copyright (c) 2013 ICT, CAS. All rights reserved.
+*/
+
 /* Copyright (c) 2004, 2011, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
