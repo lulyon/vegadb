@@ -1,6 +1,6 @@
 VegaDB
 ========
-VegaDB is an under developed storage engine for MySQL, currently version 5.1.66, not limited to one version, though.
+VegaDB is an under developed storage engine for MySQL, currently version 5.5.28, not limited to one version, though.
 
 Aiming to help store and query spatial data, the data file format is based on the shapefile format, which is a popular geospatial vector data format. 
 
