@@ -305,7 +305,7 @@ ha_example::ha_example(handlerton *hton, TABLE_SHARE *table_arg)
 */
 
 static const char *ha_example_exts[] = {
-	".csv", NullS
+	".shp", NullS
 };
 
 const char **ha_example::bas_ext() const
@@ -399,23 +399,35 @@ int ha_example::open(const char *name, int mode, uint test_if_locked)
 
 
 	/* Allocate memory for the data file descriptor. */
-	file= (CSV_INFO*)my_malloc(sizeof(CSV_INFO),MYF(MY_WME));
+	file = (SHP_INFO*)my_malloc(sizeof(SHP_INFO),MYF(MY_WME));
 	if (!file)
 	  return 1;
 
 	/* Translate the name of the name into the data file name. */
-	fn_format(file->fname, name, "", ".csv",
+	fn_format(file->fname, name, "", ".shp",
 	   MY_REPLACE_EXT|MY_UNPACK_FILENAME);
 
 	/*
 	   Open the file, and save the file handle id in the data
 	   file descriptor structure.
 	 */
-	if ((file->fd = my_open(file->fname,mode,MYF(0))) < 0)
-	{
-	  int error = my_errno;
-	  close();
-	  return error;
+	const char rd_mode = 0;
+	char * rd_access = "rb";
+	const char wr_mode = 1;
+	char * wr_access = "wb";
+	const char rw_mode = 2;
+	char *rw_access = "rb+";
+
+	char *ptr_access = 0;
+	if(mode & rw_mode) ptr_access = rw_access;
+	else if(mode & wr_mode)ptr_access = wr_access;
+	else ptr_access = rd_access;
+
+	hSHP = SHPOpen( file->fname, ptr_access);
+	if( hSHP == 0 ) {
+		int error = my_errno;
+		close();
+		return error;
 	}
 
 	/* Read operations start from the beginning of the file. */
@@ -449,14 +461,16 @@ int ha_example::close(void)
        deallocate the data file descriptor memory.
      */
     thr_lock_delete(&share->lock);
-    if (file)
-    {
-      if (file->fd >= 0)
-        my_close(file->fd, MYF(0));
-      my_free(file);
-      file = 0;
-    }
 
+    if (file)
+	{
+    	if(hSHP != 0) {
+    		SHPClose( hSHP );
+    		hSHP = 0;
+    	}
+    	my_free(file);
+    	file = 0;
+	}
 
   DBUG_RETURN(free_share(share));
 }
@@ -464,6 +478,9 @@ int ha_example::close(void)
 /*
    Read the line from the current position into the
    caller-provided record buffer.
+   fetch_line: the "line" does not necessarily mean a line.
+   It means a data unit in the data file corresponding to a
+   record in the record buffer.
  */
 int ha_example::fetch_line(uchar* buf)
 {

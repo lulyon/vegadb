@@ -45,6 +45,8 @@
 #include "handler.h"                     /* handler */
 #include "my_base.h"                     /* ha_rows */
 
+#include "shapefil.h"                    /* shapelib */
+
 /** @brief
   EXAMPLE_SHARE is a structure that will be shared among all open handlers.
   This example implements the minimum of what you will probably need.
@@ -57,14 +59,11 @@ typedef struct st_example_share {
 } EXAMPLE_SHARE;
 
 
-/* The CSV lines could be big. Read them in blocks of 512. */
-#define CSV_READ_BLOCK_SIZE   512
-
 /*
   Following the tradition of other storage engines, we put all of the
   low-level information under a separate structure.
  */
-struct CSV_INFO
+struct SHP_INFO
 {
   char fname[FN_REFLEN+1];
   int fd;
@@ -79,16 +78,16 @@ class ha_example: public handler
   EXAMPLE_SHARE *share;    ///< Shared lock info
 
   /* Low-level storage engine data. */
-  CSV_INFO* file;
+  SHP_INFO* file;
+
+  /* Shapefile handler */
+  SHPHandle	hSHP;
 
   /* Table scan cursor.*/
   my_off_t pos;
 
-  /* Buffer for reading CSV line blocks. */
-   char read_buf[CSV_READ_BLOCK_SIZE];
-
-   /* Buffer for parsing the field values. */
-   String field_buf;
+  /* See the comment in the implementation file. */
+  int fetch_line(uchar* buf);
 
 public:
   ha_example(handlerton *hton, TABLE_SHARE *table_arg);
@@ -210,9 +209,6 @@ public:
     We implement this in ha_example.cc; it's a required method.
   */
   int close(void);                                              // required
-
-  /* See the comment in the implementation file. */
-  int fetch_line(uchar* buf);
 
   /** @brief
     We implement this in ha_example.cc. It's not an obligatory method;
