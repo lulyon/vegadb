@@ -431,7 +431,7 @@ int ha_example::open(const char *name, int mode, uint test_if_locked)
 	}
 
 	/* Read operations start from the beginning of the file. */
-	pos = 0;
+	pos = 100;
 
   DBUG_RETURN(0);
 }
@@ -475,6 +475,12 @@ int ha_example::close(void)
   DBUG_RETURN(free_share(share));
 }
 
+int ha_example::isLittleEndian() const
+{
+	int i = 1;
+	return ( *((unsigned char *) &i) == 1 );
+}
+
 /*
    Read the line from the current position into the
    caller-provided record buffer.
@@ -498,163 +504,62 @@ int ha_example::fetch_line(uchar* buf)
    */
   Field** field = table->field;
 
-  /*
-    Used in parsing to remember the previous character. The impossible
-    value of 256 indicates that the last character either did not exist
-    (we are on the first one), or its value is irrelevant.
-  */
-  int last_c = 256;
+  /* binary search for shape index */
+  if(cur_pos < hSHP->panRecOffset[0] || cur_pos >= hSHP->panRecOffset[hSHP->nRecords - 1])
+	  return HA_ERR_END_OF_FILE;
 
-  /* Set to 1 if we are inside a quoted string. */
-  int in_quote = 0;
+  int left = 0;
+  int right = hSHP->nRecords - 1;
+  while(left < right) {
+	  int mid = left + (right - left) / 2;
+	  if(cur_pos < hSHP->panRecOffset[mid]) {
+		  right = mid - 1;
+	  }
+	  else {
+		  left = mid;
+	  }
+  }
+  int index = left;
+  cur_pos = hSHP->panRecOffset[index];
+  int rec_size = hSHP->panRecSize[index] + 8;   // 8 bytes for record header
+  char *rec_buf = my_malloc(rec_size, MYF(MY_WME));
+
+  uint bytes_read = my_pread(*(hSHP->fpSHP), (unsigned char *)rec_buf, rec_size, cur_pos, MYF(MY_WME));
+  if (bytes_read == MY_FILE_ERROR)
+     return HA_ERR_END_OF_FILE;
+  if (!bytes_read)
+     return HA_ERR_END_OF_FILE;
 
   /* How many bytes we have seen so far in this line. */
-  uint bytes_parsed = 0;
+  uint bytes_parsed = bytes_read;
 
-  /* Loop breaker flag. */
-  int line_read_done = 0;
-
-  /* Truncate the field value buffer. */
-  field_buf.length(0);
-
-  /* Attempt to read a whole line. */
-  for (;!line_read_done;)
+  /* shape(record) ID */
+  uint shape_id = rec_buf[0] * (1 << 24) + rec_buf[1] * (1 << 16) + rec_buf[2] * (1 << 8) + rec_buf[3];
+  /* content length */
+  uint content_len = rec_buf[4] * (1 << 24) + rec_buf[5] * (1 << 16) + rec_buf[6] * (1 << 8) + rec_buf[7];
+  /*
+	  Transfer the field value buffer contents into the corresponding Field object.
+	  This actually takes care of initializing the correct parts of the buffer
+	  argument passed to us by the caller. The internal convention of the
+	  optimizer dictates that the buffer pointers of the Field objects
+	  must already be set up to point at the correct areas of the buffer
+	  argument prior to calls to the data-retrieval methods of the handler
+	  class.
+  */
+  if (*field)
   {
-    /* Read a block into a local buffer and deal with errors. */
-    char buf[CSV_READ_BLOCK_SIZE];
-    uint bytes_read = my_pread(file->fd,(unsigned char *)buf,sizeof(buf),cur_pos,MYF(MY_WME));
-    if (bytes_read == MY_FILE_ERROR)
-      return HA_ERR_END_OF_FILE;
-    if (!bytes_read)
-      return HA_ERR_END_OF_FILE;
-
-    /*
-      If we reach this point, the read was successful. Start parsing the
-      data we have read.
-    */
-    char* p = buf;
-    char* buf_end = buf + bytes_read;
-
-    /* For each byte in the buffer. */
-    for (;p < buf_end;)
-    {
-      char c = *p;
-      int end_of_line = 0;
-      int end_of_field = 0;
-      int char_escaped = 0;
-
-      switch (c)
-      {
-        /*
-          A double-quote marks the start or the end of a quoted string
-          unless it has been escaped.
-        */
-        case '"':
-          if (last_c == '"' || last_c == '\\')
-          {
-            field_buf.append(c);
-            char_escaped = 1;
-
-            /*
-              When we see the first quote, in_quote will get flipped.
-              A subsequent quote, however, tells us we are still inside the
-              quoted string.
-            */
-            if (last_c == '"')
-              in_quote = 1;
-          }
-          else
-            in_quote = !in_quote;
-          break;
-        /*
-          Treat the backward slash as an escape character.
-        */
-        case '\\':
-          if (last_c == '\\')
-          {
-             field_buf.append(c);
-             char_escaped = 1;
-          }
-          break;
-
-        /*
-          Set the termination flags on end-of-line unless it is quoted.
-        */
-        case '\r':
-        case '\n':
-          if (in_quote)
-          {
-            field_buf.append(c);
-          }
-          else
-          {
-            end_of_line = 1;
-            end_of_field = 1;
-          }
-          break;
-
-        /* Comma signifies end-of-field unless quoted. */
-        case ',':
-          if (in_quote)
-          {
-            field_buf.append(c);
-          }
-          else
-            end_of_field = 1;
-          break;
-
-        /*
-          Regular charcters just get appended to the field
-          value buffer.
-        */
-        default:
-          field_buf.append(c);
-          break;
-      }
-
-      /*
-        If at the end a field, and a matching field exists in the table
-        (it may not if the CSV file has extra fields), transfer the field
-        value buffer contents into the corresponding Field object. This
-        actually takes care of initializing the correct parts of the buffer
-        argument passed to us by the caller. The internal convention of the
-        optimizer dictates that the buffer pointers of the Field objects
-        must already be set up to point at the correct areas of the buffer
-        argument prior to calls to the data-retrieval methods of the handler
-        class.
-      */
-      if (end_of_field && *field)
-      {
-         (*field)->store(field_buf.ptr(),field_buf.length(),
-            system_charset_info);
-         field++;
-         field_buf.length(0);
-      }
-
-      /*
-        Special case - a character that was escaped itself should not be
-        regared as an escape character.
-      */
-      if (char_escaped)
-        last_c = 256;
-      else
-        last_c = c;
-      p++;
-
-      /* Prepare for loop exit on end-of-line. */
-      if (end_of_line)
-      {
-        if (c == '\r')
-          p++;
-        line_read_done = 1;
-        in_quote = 0;
-        break;
-      }
-    }
-
-    /* Block read/parse cycle is complete - update the counters. */
-    bytes_parsed += (p - buf);
-    cur_pos += bytes_read;
+    (*field)->store((const char *)(&shape_id), 4, system_charset_info);
+    field++;
+  }
+  if (*field)
+  {
+    (*field)->store((const char *)(&content_len), 4, system_charset_info);
+    field++;
+  }
+  if (*field)
+  {
+	(*field)->store(rec_buf + 8, bytes_read - 8, system_charset_info);
+	field++;
   }
 
   /*
@@ -675,7 +580,7 @@ int ha_example::fetch_line(uchar* buf)
   }
 
   /* Move the cursor to the next record. */
-  pos += bytes_parsed;
+  pos = cur_pos + bytes_parsed;
 
   /* Report success. */
   return 0;
@@ -894,7 +799,7 @@ int ha_example::index_last(uchar *buf)
 int ha_example::rnd_init(bool scan)
 {
   DBUG_ENTER("ha_example::rnd_init");
-  pos = 0;
+  pos = 100;
   stats.records = 0;
   DBUG_RETURN(0);
 }
