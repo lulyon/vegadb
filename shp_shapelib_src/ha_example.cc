@@ -517,7 +517,7 @@ int ha_example::fetch_line(uchar* buf)
   int index = left;
   cur_pos = hSHP->panRecOffset[index];
   int rec_size = hSHP->panRecSize[index] + 8;   // 8 bytes for record header
-  char *rec_buf = my_malloc(rec_size, MYF(MY_WME));
+  char *rec_buf = (char *)my_malloc(rec_size, MYF(MY_WME));
 
   uint bytes_read = my_pread(*(hSHP->fpSHP), (unsigned char *)rec_buf, rec_size, cur_pos, MYF(MY_WME));
   if (bytes_read == MY_FILE_ERROR)
