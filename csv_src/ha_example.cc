@@ -1372,9 +1372,9 @@ mysql_declare_plugin(example)
 {
   MYSQL_STORAGE_ENGINE_PLUGIN,
   &example_storage_engine,
-  "Shapefile",
+  "csv",
   "Lu Liang, ICT CAS",
-  "VegaDB storage engine",
+  "csv storage engine",
   PLUGIN_LICENSE_GPL,
   example_init_func,                            /* Plugin Init */
   example_done_func,                            /* Plugin Deinit */
