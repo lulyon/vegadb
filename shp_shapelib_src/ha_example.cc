@@ -475,11 +475,6 @@ int ha_example::close(void)
   DBUG_RETURN(free_share(share));
 }
 
-int ha_example::isLittleEndian() const
-{
-	int i = 1;
-	return ( *((unsigned char *) &i) == 1 );
-}
 
 /*
    Read the line from the current position into the
